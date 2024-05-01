@@ -10,21 +10,19 @@ recurrent autoencoder model for weather data.
 import tensorflow as tf
 import numpy as np
 from typing import Iterable, Optional, Union, Self
-from maize.python.types import LossFunction
 
 __all__ = ['WeatherAutoencoder']
 
 # Model Definitions
 
-class WeatherAutoencoder:
+@tf.keras.utils.register_keras_serializable(package='MaizeML')
+class WeatherAutoencoder(tf.keras.Model):
     """ WeatherAutoencoder.
 
     This class defines a recurrent autoencoder model for weather data.
-    This class itself is a wrapper around a Keras model to provide a
-    fluent interface for training and evaluation.
     """
 
-    def __init__(self, codings_size: int, n_steps: int, n_features: int):
+    def __init__(self, codings_size: int, n_steps: int, n_features: int, **kwargs):
         """ Initialize the WeatherAutoencoder.
 
         Args:
@@ -32,22 +30,18 @@ class WeatherAutoencoder:
             n_steps (int): The number of time steps in the input data.
             n_features (int): The number of features in the input data.
         """
+        super().__init__(**kwargs)
         self.codings_size = codings_size
         self.n_steps = n_steps
         self.n_features = n_features
 
-        self.model, self.encoder, self.decoder = self._build_model()
+        self.encoder = self._build_encoder()
+        self.decoder = self._build_decoder()
 
-    def _build_model(self) -> tuple[tf.keras.Model, tf.keras.Model, tf.keras.Model]:
-        """ Build the model.
+    def _build_encoder(self) -> tf.keras.Model:
+        """ Build the encoder.
 
-        This method constructs the Keras model for the autoencoder.
-        The autoencoder is a recurrent neural network with a GRU encoder
-        and decoder. This does not compile the models.
-
-        Returns:
-            tuple[tf.keras.Model, tf.keras.Model, tf.keras.Model]: The model,
-                encoder, and decoder models.
+        The encoder is a recurrent neural network with a GRU layer.
         """
 
         _encoder = tf.keras.models.Sequential([
@@ -59,6 +53,14 @@ class WeatherAutoencoder:
             tf.keras.layers.Dense(self.codings_size, activation='sigmoid')
         ])
 
+        return _encoder
+
+    def _build_decoder(self) -> tf.keras.Model:
+        """ Build the decoder.
+
+        The decoder is a recurrent neural network with a GRU layer.
+        """
+
         _decoder = tf.keras.models.Sequential([
             tf.keras.layers.InputLayer(input_shape=(self.codings_size,)),
             tf.keras.layers.Dense(256, activation='relu', kernel_regularizer='l1_l2'),
@@ -69,40 +71,40 @@ class WeatherAutoencoder:
             tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.n_features, activation='sigmoid'))
         ])
 
-        _model = tf.keras.models.Sequential([_encoder, _decoder])
+        return _decoder
 
-        return _model, _encoder, _decoder
+    def call(self, x: tf.Tensor) -> tf.Tensor:
+        """ Call the autoencoder.
 
-    def compile(self, loss: Union[str, tf.keras.Loss, LossFunction], optimizer: Union[str, tf.keras.Optimizer], metrics: Iterable[str, tf.keras.Metric] = None, debug: bool = False) -> Self:
-        """ Compile the autoencoder models.
-
-        This only compiles the autoencoder model, not the encoder or decoder.
-        These are trained together.
+        This method calls the autoencoder on the input tensor.
         """
-        metrics = metrics or []
 
-        self.model.compile(loss=loss, optimizer=optimizer, metrics=metrics, run_eagerly=debug)
-        return self
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
 
-    def fit(
-            self,
-            training_dataset: tf.data.Dataset,
-            *,
-            epochs: int = 1,
-            callbacks: Iterable[tf.keras.callbacks.Callback] = None,
-            validation_dataset: Optional[tf.data.Dataset] = None
-        ) -> Self:
-        """ Fit the autoencoder models.
+    def get_config(self) -> dict[str, Union[int, str]]:
+        """ Get the configuration.
 
-        This fits the encoder and decoder models together.
+        This method gets the configuration of the WeatherAutoencoder.
         """
-        self.history = self.model.fit(training_dataset, epochs=epochs, callbacks=callbacks or [], validation_data=validation_dataset).history
-        return self
 
-    def evaluate(self, testing_dataset: tf.data.Dataset) -> Self:
-        """ Evaluate the autoencoder models.
+        config = super().get_config()
+        config.update({
+            'codings_size': self.codings_size,
+            'n_steps': self.n_steps,
+            'n_features': self.n_features
+        })
 
-        This evaluates the encoder and decoder models together.
+        return config
+
+
+    @staticmethod
+    def normalize(data: tf.Tensor) -> tf.Tensor:
+        """ Normalize the input data.
+
+        This method normalizes the input data to $(0, 1]$.
         """
-        self.evaluation_metrics = self.model.evaluate(testing_dataset)
-        return self
+
+        max_tensor = tf.math.reduce_max(data, axis=0)
+        return tf.math.divide_no_nan(data, max_tensor)

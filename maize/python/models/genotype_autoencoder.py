@@ -7,217 +7,174 @@ recurrent autoencoder model for genotype data.
 """
 
 # Imports
-from maize.python.types import LossFunction
+from maize.python.layers.repeat import Repeat
 import tensorflow as tf
 import numpy as np
 from typing import Optional, Union, Self
 
 __all__ = ['GenotypeAutoencoder']
 
-def _repeat(x: tuple[tf.Tensor, tf.RaggedTensor]) -> tf.RaggedTensor:
-    """ Repeat the input tensor.
-
-    This function repeats the input tensor along the time axis.
-    This particular function will repeat the given tensor by a
-    dynamic amount, specified by the second element of the input.
-
-    Args:
-        x (tuple[tf.Tensor, tf.RaggedTensor]): The input tensor.
-
-    Returns:
-        tf.RaggedTensor: The repeated tensor.
-    """
-    x, inp = x
-
-    max_row_length = tf.math.reduce_max(inp.row_lengths())
-    x = tf.expand_dims(x, axis=1)
-    x = tf.repeat(x, repeats=max_row_length, axis=1)
-    x = tf.RaggedTensor.from_tensor(x, inp.row_lengths())
-    return x
-
-class GenotypeAutoencoder:
+@tf.keras.utils.register_keras_serializable(package='MaizeML')
+class GenotypeAutoencoder(tf.keras.Model):
     """ GenotypeAutoencoder.
 
     This class defines a recurrent autoencoder model for genotype data.
-    This class itself is a wrapper around a Keras model to provide a
-    fluent interface for training and evaluation.
     """
 
-    def __init__(self, codings_size: int, n_features: int) -> None:
+    def __init__(self, codings_size: int, n_features: Optional[int] = None, **kwargs):
         """ Initialize the GenotypeAutoencoder.
 
         Args:
             codings_size (int): The size of the latent space codings.
+            n_features (Optional[int]): The number of features in the input data.
+                                        If None, then the number of features is determined at runtime,
+                                        and the model uses ragged tensors (experimental).
         """
+        super().__init__(**kwargs)
         self.codings_size = codings_size
         self.n_features = n_features
-        self.lookup = tf.keras.layers.StringLookup(vocabulary=[b'0/0', b'0/1', b'1/1', b'./.'], mask_token=None)
+        self.lookup = tf.keras.layers.StringLookup(vocabulary=[b'0/0', b'0/1', b'1/1', b'./.'])
+        self._input = (
+                tf.keras.layers.Input(
+                    shape=(None, self.n_features, len(self.lookup.get_vocabulary())),
+                    ragged=True
+                )
+                if n_features is None else
+                tf.keras.layers.Input(
+                    shape=(self.n_features,len(self.lookup.get_vocabulary()))
+                )
+            )
 
-        self.model, self.encoder, self.decoder = self._build_model()
+        self.encoder = self._build_encoder()
+        self.decoder = self._build_decoder()
 
-    def _build_model(self) -> tuple[tf.keras.Model, tf.keras.Model, tf.keras.Model]:
-        """ Build the model.
+    def _build_encoder(self) -> tf.keras.Model:
+        """ Build the encoder.
 
-        This method constructs the Keras model for the autoencoder.
-        It defines a recurrent neural network with a GRU encoder and decoder.
-        This does not compile the models.
-
-        Returns:
-            tuple[tf.keras.Model, tf.keras.Model, tf.keras.Model]: The model,
-                encoder, and decoder models.
+        The encoder is a recurrent neural network with a GRU layer.
         """
 
-        input_layer = tf.keras.Input(shape=(None, self.n_features), ragged=True)
-        bidirectional_1 = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(128, return_sequences=True))(input_layer)
-        bidirectional_2 = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(128))(bidirectional_1)
-        dropout = tf.keras.layers.Dropout(0.3)(bidirectional_2)
-        dense_1 = tf.keras.layers.Dense(256, activation='relu')(dropout)
-        dense_2 = tf.keras.layers.Dense(self.codings_size, activation='sigmoid')(dense_1)
 
-        _encoder = tf.keras.Model(inputs=input_layer, outputs=dense_2)
+        _encoder = tf.keras.models.Sequential([
+            self._input,
+            tf.keras.layers.Dense(256, activation='relu', kernel_regularizer='l1_l2'),
+            tf.keras.layers.Dense(self.codings_size, activation='sigmoid')
+        ])
 
-        latent_input = tf.keras.Input(shape=(self.codings_size,))
-        dense_3 = tf.keras.layers.Dense(256, activation='relu')(latent_input)
-        repeat_layer = tf.keras.layers.Lambda(_repeat)([dense_3, input_layer])
-        bidirectional_4 = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(128, return_sequences=True))(repeat_layer)
-        bidirectional_5 = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(128, return_sequences=True))(bidirectional_4)
-        time_distributed = tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.n_features, activation='softmax'))(bidirectional_5)
+        return _encoder
 
-        _decoder = tf.keras.Model(inputs=latent_input, outputs=time_distributed)
+    def _build_decoder(self) -> tf.keras.Model:
+        """ Build the decoder.
 
-        _model = tf.keras.Model(inputs=input_layer, outputs=_decoder(_encoder(input_layer)))
+        The decoder is a recurrent neural network with a GRU layer.
+        """
 
-        return _model, _encoder, _decoder
+        _latent_input = tf.keras.Input(shape=(self.codings_size,))
+        _dense_1 = tf.keras.layers.Dense(256, activation='relu')(_latent_input)
+        _repeat_layer = Repeat()([_dense_1, self._input]) if self.n_features is None else tf.keras.layers.RepeatVector(self.n_features)(_dense_1)
+        _bidirectional_1 = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(128, return_sequences=True))(_repeat_layer)
+        _bidirectional_2 = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(128, return_sequences=True))(_bidirectional_1)
+        _time_distributed = tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(len(self.lookup.get_vocabulary()), activation='softmax'))(_bidirectional_2)
+        _decoder = tf.keras.Model(inputs=_latent_input, outputs=_time_distributed)
 
-    def _one_hot_encode(self, x: tf.Tensor) -> tf.RaggedTensor:
-        """ One-hot encode the input tensor from a Genotype string to
-        a ragged tensor.
+        return _decoder
+
+    def _one_hot_encode(self, x: tf.Tensor) -> Union[tf.Tensor, tf.RaggedTensor]:
+        """ One-hot encode the input tensor from a Genotype string to a tensor.
+
+        The returned tensor is ragged if the n_features is not specified.
 
         Args:
             x (tf.Tensor): The input tensor.
 
         Returns:
-            tf.RaggedTensor: The one-hot encoded tensor.
+            tf.RaggedTensor: The one-hot encoded tensor if n_features is None.
+            tf.Tensor: The one-hot encoded tensor if n_features is not None.
         """
 
         x = tf.strings.split(x, ' ')
         x = self.lookup(x)
         x = tf.one_hot(x, depth=len(self.lookup.get_vocabulary()))
+        if self.n_features is not None:
+            x = tf.reshape(x, (-1, self.n_features, len(self.lookup.get_vocabulary())))
         return x
 
-    def _calculate_accuracy(self, y_true: tf.RaggedTensor, y_pred: tf.RaggedTensor) -> tf.Tensor:
-        accuracy = 0
-        for i in range(len(y_true)):
-            accuracy += tf.reduce_sum(tf.cast(tf.equal(y_true[i], y_pred[i]), tf.float32))
+    def call(self, inputs: Union[tf.Tensor, tf.RaggedTensor]) -> Union[tf.Tensor, tf.RaggedTensor]:
+        """ Call.
 
-        return accuracy / (len(y_true) * y_true.row_lengths()[0])
-
-    def compile(self, loss: Union[tf.keras.losses.Loss, LossFunction], optimizer: tf.keras.optimizers.Optimizer) -> Self:
-        """ Compile the model.
-
-        This method compiles the model with the given optimizer, loss function,
-        and metrics.
+        This method calls the GenotypeAutoencoder model on the input tensor.
 
         Args:
-            optimizer (Union[str, tf.keras.optimizers.Optimizer]): The optimizer to use.
-            loss (Union[str, tf.keras.losses.Loss]): The loss function to use.
-            metrics (Optional[Iterable[Union[str, tf.keras.metrics.Metric]]]): The metrics to use.
-        """
-        self.optimizer = optimizer
-        self.loss = loss
-
-        return self
-
-    def fit(
-            self,
-            training_dataset: tf.data.Dataset,
-            *,
-            validation_dataset: Optional[tf.data.Dataset] = None,
-            epochs: int = 1,
-            early_stopping: bool = True,
-            patience: int = 10
-        ) -> None:
-        """ Fit the model.
-
-        This method fits the model to the given training data.
-
-        Args:
-            training_dataset (tf.data.Dataset): The training dataset.
-            validation_dataset (tf.data.Dataset): The validation dataset.
-            epochs (int): The number of epochs to train for.
-            verbose (int): The verbosity level.
-        """
-
-        history = {'loss': [], 'accuracy': []}
-        if validation_dataset is not None:
-            history['val_loss'] = []
-            history['val_accuracy'] = []
-        current_patience = 0
-        min_val_loss = None
-
-        for epoch in range(epochs):
-            for X_batch in training_dataset:
-                X_batch = self._one_hot_encode(X_batch)
-                with tf.GradientTape() as tape:
-                    y = self.model(X_batch)
-                    loss = self.loss(X_batch, y)
-                    gradients = tape.gradient(loss, self.model.trainable_variables)
-                    self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-                scalar_loss = tf.reduce_mean(loss)
-                accuracy = self._calculate_accuracy(X_batch, y)
-                print(f'Epoch {epoch + 1} | Loss: {scalar_loss:.5}, Accuracy: {accuracy:.5}', end="\r")
-            history['loss'].append(scalar_loss)
-            history['accuracy'].append(accuracy)
-            print(f"Epoch {epoch + 1} | Loss: {scalar_loss:.5}, Accuracy: {accuracy:.5}", end=" - ")
-            if validation_dataset:
-                val_loss = []
-                val_accuracy = []
-                for V_batch in validation_dataset:
-                    V_batch = self._one_hot_encode(V_batch)
-                    y = self.model(V_batch)
-                    loss = self.loss(V_batch, y)
-                    scalar_loss = tf.reduce_mean(loss)
-                    accuracy = self._calculate_accuracy(V_batch, y)
-                    val_loss.append(scalar_loss)
-                    val_accuracy.append(accuracy)
-                val_loss = tf.reduce_mean(val_loss)
-                val_accuracy = tf.reduce_mean(val_accuracy)
-                if min_val_loss is None or val_loss < min_val_loss:
-                    min_val_loss = val_loss
-                    current_patience = 0
-                else:
-                    current_patience += 1
-                history['val_loss'].append(val_loss)
-                history['val_accuracy'].append(val_accuracy)
-                print(f"Val Loss: {val_loss:.5}, Val Accuracy: {val_accuracy:.5}")
-                if early_stopping and current_patience >= patience:
-                    print(f"Early stopping after {epoch + 1} epochs.")
-                    break
-
-        self.history = history
-        return self
-
-    def evaluate(self, X: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """ Evaluate the model.
-
-        This method evaluates the model on the given data.
-
-        Args:
-            X (tf.Tensor): The input data.
+            inputs (Union[tf.Tensor, tf.RaggedTensor]): The input tensor.
 
         Returns:
-            tuple[tf.Tensor, tf.Tensor]: The loss and accuracy.
+            tf.Tensor: The output tensor.
         """
-        test_accuracy = []
-        test_loss = []
-        for T_batch in X:
-            T_batch = self._one_hot_encode(T_batch)
-            y = self.model(T_batch)
-            loss = self.loss(T_batch, y)
-            scalar_loss = tf.reduce_mean(loss)
-            accuracy = self._calculate_accuracy(T_batch, y)
-            test_loss.append(scalar_loss)
-            test_accuracy.append(accuracy)
-        test_loss = tf.reduce_mean(test_loss)
-        test_accuracy = tf.reduce_mean(test_accuracy)
-        return test_loss, test_accuracy
+        return self.decoder(self.encoder(inputs))
+
+    def train_step(self, data):
+        x, y = data
+
+        x = self._one_hot_encode(x)
+        y = self._one_hot_encode(y)
+
+        with tf.GradientTape() as tape:
+            y_pred = self(x, training=True)
+            loss = self.compute_loss(y, y_pred)
+
+        gradients = tape.gradient(loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+
+        for metric in self.metrics:
+            if metric.name == 'loss':
+                metric.update_state(loss)
+            else:
+                metric.update_state(y, y_pred)
+
+        return {m.name: m.result() for m in self.metrics}
+
+    def test_step(self, data):
+        x, y = data
+
+        x = self._one_hot_encode(x)
+        y = self._one_hot_encode(y)
+
+        y_pred = self(x, training=False)
+        loss = self.compute_loss(y, y_pred)
+
+        for metric in self.metrics:
+            if metric.name == 'loss':
+                metric.update_state(loss)
+            else:
+                metric.update_state(y, y_pred)
+
+        return {m.name: m.result() for m in self.metrics}
+
+    def get_config(self) -> dict[str, str]:
+        """ Get the configuration.
+
+        This method gets the configuration of the GenotypeAutoencoder model.
+
+        Returns:
+            dict[str, str]: The configuration of the model.
+        """
+        config = super().get_config()
+        config.update({
+            'codings_size': self.codings_size,
+            'n_features': self.n_features
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config: dict[str, str]) -> Self:
+        """ Create the model from the configuration.
+
+        This method creates the GenotypeAutoencoder model from the configuration.
+
+        Args:
+            config (dict[str, str]): The configuration of the model.
+
+        Returns:
+            Self: The GenotypeAutoencoder model.
+        """
+        return cls(**config)
