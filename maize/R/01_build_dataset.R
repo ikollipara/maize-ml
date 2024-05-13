@@ -200,7 +200,7 @@ environment_data <- phenotype_data %>%
 
 
 missing_lat_lon <- filter(environment_data, is.na(lat) & is.na(lon))
-coords <- apply(missing_lat_lon, 1, function(x){google_geocode(address = paste(x['city'], x['state'], sep = ', '), key = 'AIzaSyBx0dJsUYphK3y144m_ldAOhc7loeHZUOo')})
+coords <- apply(missing_lat_lon, 1, function(x){google_geocode(address = paste(x['city'], x['state'], sep = ', '), key = "<google-key>")})
 missing_lat_lon <- cbind(missing_lat_lon, do.call(rbind, lapply(coords, geocode_coordinates)))
 
 missing_lat_lon <- missing_lat_lon[, c(1:3, 6:9)] %>%
